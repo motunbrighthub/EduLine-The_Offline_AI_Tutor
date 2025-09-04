@@ -1,5 +1,5 @@
-
+gradio
 pandas
-streamlit
+sqlite3
 
 
