@@ -1,5 +1,4 @@
-# app.py
-import streamlit as st
+import gradio as gr
 import pandas as pd
 import random
 import sqlite3
@@ -11,15 +10,9 @@ from typing import Dict, List
 # ==============================
 # Config
 # ==============================
-st.set_page_config(
-    page_title="EDULINE Adaptive Quiz",
-    page_icon="logo_favicon1.png",
-    layout="centered",
-)
-
 import os
 BASE_DIR = os.path.dirname(__file__)
-QUESTIONS_CSV = os.path.join(BASE_DIR, "questions_clus8.csv")   # your question file
+QUESTIONS_CSV = os.path.join(BASE_DIR, "questions_clus8.csv")
 DB_PATH = "eduline.db"
 DEFAULT_TOTAL_Q = 5
 CLUSTER_LIMITS = {"English": 7, "Mathematics": 8}
@@ -70,342 +63,363 @@ def save_result(conn, student_uuid: str, subject: str, score: int, total_questio
     """, (student_uuid, subject, score, total_questions, progress, json.dumps(weak_clusters), datetime.now().isoformat()))
     conn.commit()
 
-# Initialize DB
 conn = init_db(DB_PATH)
 
 # ==============================
 # Load questions
 # ==============================
-@st.cache_data
 def load_questions(path):
     df = pd.read_csv(path)
-    # Ensure Cluster is integer and Subject exists
     df["Cluster"] = df["Cluster"].astype(int)
     return df
-
 df_all = load_questions(QUESTIONS_CSV)
+SUBJECTS = sorted(df_all["Subject"].unique())
 
 # ==============================
-# Session state init
-# ==============================
-if "app" not in st.session_state:
-    st.session_state.app = {
-        "stage": "register",   # register -> subject -> quiz -> finished
-        "student_uuid": None,
-        "name": "",
-        "area": "",
-    }
-
-if "quiz" not in st.session_state:
-    st.session_state.quiz = {
-        "started": False,
-        "subject": None,
-        "cluster": 0,
-        "question_index": 0,
-        "total_questions": DEFAULT_TOTAL_Q,
-        "score": 0,
-        "used_indices": [],      # store row indices used (integers)
-        "current_question": None,
-        "submitted": False,
-        "feedback": "",
-        "weak_clusters": {},     # {cluster_id: mistakes}
-        "mode": "normal",        # normal | weak_only
-        "weak_only_list": [],
-        "cluster_name_map": {}   # user-provided topic names
-    }
-
-app = st.session_state.app
-quiz = st.session_state.quiz
-
-# ==============================
-# Helpers: ID, quiz logic, cluster names
+# Helpers
 # ==============================
 def gen_uuid() -> str:
     return "EDU-" + str(uuid.uuid4())[:8].upper()
 
-def reset_quiz_state(subject: str, total_q: int, mode: str = "normal", weak_only_list: List[int] = None):
+def get_cluster_name(subject: str, cluster_id: int) -> str:
+    defaults = {1: "Foundations", 2: "Basics", 3: "Practice", 4: "Intermediate", 5: "Advanced Practice", 6: "Advanced", 7: "Expert", 8: "Mastery"}
+    return defaults.get(cluster_id, f"Cluster {cluster_id}")
+
+# ==============================
+# Gradio app functions
+# ==============================
+
+def initialize_state():
+    return {
+        "stage": "register",
+        "student_uuid": None,
+        "name": "",
+        "area": "",
+        "quiz": {
+            "started": False,
+            "subject": None,
+            "cluster": 0,
+            "question_index": 0,
+            "total_questions": DEFAULT_TOTAL_Q,
+            "score": 0,
+            "used_indices": [],
+            "current_question": None,
+            "submitted": False,
+            "feedback": "",
+            "weak_clusters": {},
+            "mode": "normal",
+            "weak_only_list": [],
+        }
+    }
+
+def handle_registration(name, area, state):
+    student_uuid = gen_uuid()
+    state["student_uuid"] = student_uuid
+    state["name"] = name.strip()
+    state["area"] = area
+    state["stage"] = "subject"
+    try:
+        insert_user(conn, student_uuid, state["name"], state["area"])
+        feedback = f"Registered! Your Student ID is: **{student_uuid}**"
+    except Exception as e:
+        feedback = f"Could not save registration: {e}"
+    
+    return state, gr.update(visible=True), gr.update(visible=False), feedback
+
+def start_quiz(subject, total_questions, state):
     mid = CLUSTER_LIMITS.get(subject, 6) // 2
-    start_cluster = mid if mode == "normal" else (weak_only_list[0] if weak_only_list else mid)
-    quiz.update({
+    state["quiz"].update({
         "started": True,
         "subject": subject,
-        "cluster": start_cluster,
+        "cluster": mid,
         "question_index": 0,
-        "total_questions": total_q,
+        "total_questions": total_questions,
         "score": 0,
         "used_indices": [],
         "current_question": None,
         "submitted": False,
         "feedback": "",
-        "weak_clusters": {} if mode == "normal" else {c:0 for c in (weak_only_list or [])},
-        "mode": mode,
-        "weak_only_list": weak_only_list or []
+        "weak_clusters": {},
+        "mode": "normal",
+        "weak_only_list": []
     })
+    state["stage"] = "quiz"
+    return state, *load_next_question(state)
 
-def get_cluster_name(subject: str, cluster_id: int) -> str:
-    # Use mapping in quiz["cluster_name_map"] if provided, else default friendly names
-    mapping = quiz.get("cluster_name_map", {})
-    key = f"{subject}_{cluster_id}"
-    if key in mapping and mapping[key].strip():
-        return mapping[key].strip()
-    # default generic names by difficulty
-    defaults = {
-        1: "Foundations",
-        2: "Basics",
-        3: "Practice",
-        4: "Intermediate",
-        5: "Advanced Practice",
-        6: "Advanced",
-        7: "Expert",
-        8: "Mastery"
-    }
-    return defaults.get(cluster_id, f"Cluster {cluster_id}")
+def start_weak_quiz(subject, total_questions, state):
+    weak_list = [c for c, m in state["quiz"]["weak_clusters"].items() if m > 0]
+    if not weak_list:
+        return state, gr.update(visible=True), "No recorded weak areas yet. Try a normal quiz first."
+    
+    mid = CLUSTER_LIMITS.get(subject, 6) // 2
+    state["quiz"].update({
+        "started": True,
+        "subject": subject,
+        "cluster": weak_list[0] if weak_list else mid,
+        "question_index": 0,
+        "total_questions": total_questions,
+        "score": 0,
+        "used_indices": [],
+        "current_question": None,
+        "submitted": False,
+        "feedback": "",
+        "weak_clusters": {c: 0 for c in weak_list},
+        "mode": "weak_only",
+        "weak_only_list": weak_list
+    })
+    state["stage"] = "quiz"
+    return state, *load_next_question(state)
 
-def load_next_question():
-    df_subj = df_all[df_all["Subject"] == quiz["subject"]].reset_index(drop=True)
-    # if mode is weak_only, restrict cluster choices
+def load_next_question(state):
+    quiz = state["quiz"]
+    df_subj = df_all[df_all["Subject"] == quiz["subject"]]
+    
     target_cluster = quiz["cluster"]
     if quiz["mode"] == "weak_only" and quiz["weak_only_list"]:
         if target_cluster not in quiz["weak_only_list"]:
             target_cluster = random.choice(quiz["weak_only_list"])
             quiz["cluster"] = target_cluster
-
+    
     subset = df_subj[df_subj["Cluster"] == target_cluster].drop(quiz["used_indices"], errors="ignore")
     if subset.empty:
-        # fallback to other weak clusters in weak_only mode, else any remaining
         if quiz["mode"] == "weak_only" and quiz["weak_only_list"]:
             subset = df_subj[df_subj["Cluster"].isin(quiz["weak_only_list"])].drop(quiz["used_indices"], errors="ignore")
         else:
             subset = df_subj.drop(quiz["used_indices"], errors="ignore")
-
+    
     if subset.empty:
-        return False
-
+        state["stage"] = "finished"
+        return state, gr.update(visible=False), "No more questions available for this subject/mode.", "Completed", "0%", "0/0"
+    
     q = subset.sample(1).iloc[0]
-    quiz["current_question"] = q
-    quiz["used_indices"].append(q.name)  # index in df_subj after reset_index
+    quiz["current_question"] = q.to_dict()
+    quiz["used_indices"].append(q.name)
     quiz["submitted"] = False
-    quiz["feedback"] = ""
-    return True
+    
+    friendly_name = get_cluster_name(quiz["subject"], quiz["cluster"])
+    question_text = q["Question"]
+    options = {
+        "A": q["Option A"], 
+        "B": q["Option B"], 
+        "C": q["Option C"], 
+        "D": q["Option D"]
+    }
+    progress_val = quiz["question_index"] / quiz["total_questions"]
+    progress_text = f"Question {quiz['question_index'] + 1} of {quiz['total_questions']}"
+    score_text = f"Score: {quiz['score']}"
+    
+    return (
+        state, 
+        gr.update(visible=True), 
+        gr.update(value=question_text), 
+        gr.update(value=list(options.keys())), 
+        gr.update(label=f"Topic: **{friendly_name}** (Cluster {quiz['cluster']})"), 
+        gr.update(value=progress_val), 
+        gr.update(value=progress_text),
+        gr.update(value=score_text),
+        gr.update(value=None), # reset radio button
+        "" # clear feedback
+    )
 
-def submit_answer(choice_key: str):
+def handle_submit(choice, state):
+    quiz = state["quiz"]
     q = quiz["current_question"]
     correct = str(q["Correct Answer"]).strip().upper()
-    cluster_at_time = quiz["cluster"]
-    if choice_key == correct:
+    cluster_at_time = q["Cluster"]
+
+    if choice == correct:
         quiz["score"] += 1
         if quiz["mode"] == "normal":
-            quiz["cluster"] = min(CLUSTER_LIMITS.get(quiz["subject"], quiz["cluster"]+1), quiz["cluster"] + 1)
-        quiz["feedback"] = "✅ Correct! Great job."
+            quiz["cluster"] = min(CLUSTER_LIMITS.get(quiz["subject"], quiz["cluster"] + 1), quiz["cluster"] + 1)
+        feedback = "✅ Correct! Great job."
     else:
         if quiz["mode"] == "normal":
             quiz["cluster"] = max(MIN_CLUSTER, quiz["cluster"] - 1)
-        quiz["feedback"] = f"❌ Wrong! Correct answer: {correct}"
+        feedback = f"❌ Wrong! Correct answer: {correct}"
         quiz["weak_clusters"][cluster_at_time] = quiz["weak_clusters"].get(cluster_at_time, 0) + 1
+    
     quiz["submitted"] = True
+    
+    score_text = f"Score: {quiz['score']}"
+    
+    return state, feedback, gr.update(interactive=False), gr.update(interactive=True), gr.update(value=score_text)
 
-def finish_and_record():
-    # Save results to DB
+def next_question(state):
+    quiz = state["quiz"]
+    quiz["question_index"] += 1
+    
+    if quiz["question_index"] >= quiz["total_questions"]:
+        finish_and_record(state)
+        return state, gr.update(visible=False), gr.update(visible=False), gr.update(visible=True)
+    
+    return state, gr.update(visible=True), gr.update(visible=True), gr.update(visible=False), *load_next_question(state)
+
+def finish_and_record(state):
+    quiz = state["quiz"]
     progress_ratio = quiz["question_index"] / max(1, quiz["total_questions"])
     try:
-        save_result(conn, app["student_uuid"], quiz["subject"], quiz["score"], quiz["total_questions"], progress_ratio, quiz["weak_clusters"])
+        save_result(conn, state["student_uuid"], quiz["subject"], quiz["score"], quiz["total_questions"], progress_ratio, quiz["weak_clusters"])
     except Exception as e:
-        st.warning(f"Could not save results to DB: {e}")
-
+        print(f"Could not save results to DB: {e}")
+    
     quiz["started"] = False
-    app["stage"] = "finished"
+    state["stage"] = "finished"
+    return state
 
-# ==============================
-# UI: Top header
-# ==============================
-st.title("🎓 EDULINE")
-st.subheader("The Offline AI Tutor")
-
-# Optional: show small student info summary on sidebar if registered
-if app.get("student_uuid"):
-    st.sidebar.markdown(f"**Student ID:** {app['student_uuid']}")
-    if app.get("name"):
-        st.sidebar.markdown(f"**Name:** {app['name']}")
-    if app.get("area"):
-        st.sidebar.markdown(f"**Area:** {app['area']}")
-    # allow viewing past results
-    if st.sidebar.button("Show my past results"):
-        try:
-            df_results = pd.read_sql_query("SELECT * FROM results WHERE student_uuid=?", conn, params=(app['student_uuid'],))
-            if df_results.empty:
-                st.sidebar.info("No previous results found.")
-            else:
-                st.sidebar.dataframe(df_results.sort_values("taken_at", ascending=False).head(10))
-        except Exception as e:
-            st.sidebar.error(f"Failed to fetch results: {e}")
-
-# ==============================
-# STAGE: Register
-# ==============================
-if app["stage"] == "register":
-    st.markdown("### 👋 Welcome! Create your student profile")
-    col1, col2 = st.columns(2)
-    with col1:
-        name = st.text_input("Name (optional)", value=app.get("name", ""))
-    with col2:
-        area = st.radio("Where do you live?", ["Urban", "Rural"], index=0 if app.get("area","Urban") == "Urban" else 1)
-
-    if st.button("Create Student ID"):
-        student_uuid = gen_uuid()
-        app["student_uuid"] = student_uuid
-        app["name"] = name.strip()
-        app["area"] = area
-        # insert into DB
-        try:
-            insert_user(conn, student_uuid, app["name"], app["area"])
-        except Exception as e:
-            st.warning(f"Could not save registration: {e}")
-        st.success(f"Registered! Your Student ID is: **{student_uuid}**")
-        app["stage"] = "subject"
-        st.rerun()
-
-# ==============================
-# STAGE: Subject selection & cluster-name overrides
-# ==============================
-elif app["stage"] == "subject":
-    st.markdown(f"#### Welcome{', ' + app['name'] if app.get('name') else ''}! (ID: **{app['student_uuid']}**, Area: **{app['area']}**)")
-    subject = st.selectbox("Select subject:", options=sorted(df_all["Subject"].unique()))
-    total_q = st.slider("How many questions this round?", 3, 20, DEFAULT_TOTAL_Q)
-
-
-    # show controls
-    col1, col2 = st.columns(2)
-    with col1:
-        if st.button("Start Adaptive Quiz"):
-            # save mapping in session
-
-            reset_quiz_state(subject, total_q, mode="normal")
-            app["stage"] = "quiz"
-            st.rerun()
-    with col2:
-        if st.button("Retry Weak Areas (if any)"):
-            weak_list = [c for c, m in quiz["weak_clusters"].items() if m > 0]
-            if not weak_list:
-                st.info("No recorded weak areas yet. Try a normal quiz first.")
-            else:
-                # weak-only uses same subject
-                quiz["cluster_name_map"].update(cluster_map_local)
-                reset_quiz_state(subject, total_q, mode="weak_only", weak_only_list=weak_list)
-                app["stage"] = "quiz"
-                st.rerun()
-
-# ==============================
-# STAGE: Quiz
-# ==============================
-elif app["stage"] == "quiz":
-    if not quiz["started"]:
-        st.warning("No active quiz. Returning to subject page.")
-        app["stage"] = "subject"
-        st.rerun()
-
-    st.markdown(f"#### Subject: **{quiz['subject']}**")
-    st.caption(f"Mode: {'Weak-only' if quiz['mode']=='weak_only' else 'Adaptive'} | Student ID: {app['student_uuid']}")
-
-    # load next question if needed
-    if quiz["current_question"] is None:
-        ok = load_next_question()
-        if not ok:
-            st.warning("No more questions available for this subject/mode.")
-            finish_and_record()
-            st.rerun()
-
-    # Progress bar (no percentage text)
-    progress_ratio = quiz["question_index"] / quiz["total_questions"]
-    st.progress(progress_ratio)
-    st.write(f"Question {quiz['question_index'] + 1} of {quiz['total_questions']}")
-
-    q = quiz["current_question"]
-    # Display friendly cluster name
-    friendly_name = get_cluster_name(quiz["subject"], quiz["cluster"])
-    st.info(f"Topic: **{friendly_name}** (Cluster {quiz['cluster']})")
-    st.markdown(q["Question"])
-
-    options = {"A": q["Option A"], "B": q["Option B"], "C": q["Option C"], "D": q["Option D"]}
-    choice = st.radio("Choose answer:", options=list(options.keys()),
-                      format_func=lambda k: f"{k}. {options[k]}",
-                      key=f"choice_{quiz['question_index']}")
-
-    col1, col2, col3 = st.columns([1,1,1])
-    with col1:
-        if st.button("Submit Answer"):
-            submit_answer(choice)
-            st.rerun()
-    with col2:
-        if st.button("Quit Quiz"):
-            # save partial progress and finish
-            finish_and_record()
-            st.warning("You quit the quiz early. Your progress is saved.")
-            st.rerun()
-    with col3:
-        if st.button("Restart Quiz"):
-            # reset to subject selection stage but keep registration
-            quiz.update({
-                "started": False,
-                "subject": None,
-                "cluster": 0,
-                "question_index": 0,
-                "total_questions": DEFAULT_TOTAL_Q,
-                "score": 0,
-                "used_indices": [],
-                "current_question": None,
-                "submitted": False,
-                "feedback": "",
-                "weak_clusters": {},
-                "mode": "normal",
-                "weak_only_list": []
-            })
-            app["stage"] = "subject"
-            st.rerun()
-
-    # After submitting
-    if quiz["submitted"]:
-        if "✅" in quiz["feedback"]:
-            st.success(quiz["feedback"])
-        else:
-            st.error(quiz["feedback"])
-
-        # Next or finish
-        if st.button("Next Question"):
-            quiz["question_index"] += 1
-            quiz["current_question"] = None
-            quiz["submitted"] = False
-            quiz["feedback"] = ""
-            # If done
-            if quiz["question_index"] >= quiz["total_questions"]:
-                finish_and_record()
-            st.rerun()
-
-# ==============================
-# STAGE: Finished
-# ==============================
-elif app["stage"] == "finished":
-    st.balloons()
-    st.subheader("🎓 Quiz Completed!")
-    st.write(f"**Final Score:** {quiz['score']} / {quiz['total_questions']}")
-    st.progress(1.0)  # fully filled bar
-
+def display_results(state):
+    quiz = state["quiz"]
+    result_text = f"**Final Score:** {quiz['score']} / {quiz['total_questions']}"
+    weak_areas = ""
     if quiz["weak_clusters"]:
-        st.markdown("### ⚠ Weak Areas")
-        for cl, misses in sorted(quiz["weak_clusters"].items(), key=lambda x: -x[1]):
-            st.write(f"- {get_cluster_name(quiz['subject'], cl)} (Cluster {cl}): {misses} mistake(s)")
+        weak_areas += "### ⚠ Weak Areas\n"
+        sorted_weak = sorted(quiz["weak_clusters"].items(), key=lambda x: -x[1])
+        for cl, misses in sorted_weak:
+            weak_areas += f"- {get_cluster_name(quiz['subject'], cl)} (Cluster {cl}): {misses} mistake(s)\n"
+    
+    return state, gr.update(visible=True), gr.update(value=result_text), gr.update(value=weak_areas), gr.update(visible=True)
 
-    col1, col2 = st.columns(2)
-    with col1:
-        if st.button("Retry Weak Areas"):
-            weak_list = [c for c, m in quiz["weak_clusters"].items() if m > 0]
-            if not weak_list:
-                st.info("No weak areas recorded. Try a quiz first.")
-            else:
-                reset_quiz_state(quiz["subject"], quiz["total_questions"], mode="weak_only", weak_only_list=weak_list)
-                app["stage"] = "quiz"
-                st.rerun()
-    with col2:
-        if st.button("Choose Another Subject"):
-            app["stage"] = "subject"
-            st.rerun()
+def return_to_subject(state):
+    state["stage"] = "subject"
+    return state, gr.update(visible=False), gr.update(visible=True), gr.update(visible=False)
 
+def quit_quiz(state):
+    finish_and_record(state)
+    return state, gr.update(visible=False), gr.update(visible=False), gr.update(visible=True)
+
+# ==============================
+# Gradio Blocks UI
+# ==============================
+with gr.Blocks(title="EDULINE Adaptive Quiz") as demo:
+    state = gr.State(value=initialize_state())
+    
+    gr.Markdown("## 🎓 EDULINE\n### The Offline AI Tutor")
+
+    # ==============================
+    # Stage 1: Registration
+    # ==============================
+    with gr.Group(visible=True) as register_page:
+        gr.Markdown("### 👋 Welcome! Create your student profile")
+        name_input = gr.Text(label="Name (optional)")
+        area_radio = gr.Radio(["Urban", "Rural"], label="Where do you live?", value="Urban")
+        reg_btn = gr.Button("Create Student ID")
+        reg_feedback = gr.Markdown("")
+
+    # ==============================
+    # Stage 2: Subject Selection
+    # ==============================
+    with gr.Group(visible=False) as subject_page:
+        welcome_md = gr.Markdown("")
+        subject_dropdown = gr.Dropdown(SUBJECTS, label="Select subject:")
+        total_q_slider = gr.Slider(3, 20, value=DEFAULT_TOTAL_Q, step=1, label="How many questions this round?")
+        
+        with gr.Row():
+            start_btn = gr.Button("Start Adaptive Quiz")
+            retry_weak_btn = gr.Button("Retry Weak Areas (if any)")
+        subject_feedback = gr.Markdown("")
+
+    # ==============================
+    # Stage 3: Quiz
+    # ==============================
+    with gr.Group(visible=False) as quiz_page:
+        gr.Markdown("### Quiz in Progress")
+        quiz_subject_md = gr.Markdown("")
+        quiz_info_md = gr.Markdown("")
+        quiz_progress = gr.Progress(0, 1.0)
+        
+        with gr.Row():
+            q_info = gr.Markdown("")
+            score_info = gr.Markdown("")
+
+        topic_info = gr.Markdown("")
+        question_text = gr.Markdown()
+        choice_radio = gr.Radio(["A", "B", "C", "D"], label="Choose an answer:", interactive=True)
+        
+        with gr.Row():
+            submit_btn = gr.Button("Submit Answer", interactive=True)
+            next_btn = gr.Button("Next Question", interactive=False, variant="primary")
+            quit_btn = gr.Button("Quit Quiz")
+        quiz_feedback = gr.Markdown("")
+
+    # ==============================
+    # Stage 4: Finished
+    # ==============================
+    with gr.Group(visible=False) as finished_page:
+        gr.Markdown("### 🎓 Quiz Completed!")
+        score_md = gr.Markdown()
+        weak_areas_md = gr.Markdown()
+        
+        with gr.Row():
+            retry_weak_after_finish_btn = gr.Button("Retry Weak Areas")
+            choose_another_subject_btn = gr.Button("Choose Another Subject")
+
+    # ==============================
+    # Event listeners
+    # ==============================
+    reg_btn.click(
+        fn=handle_registration,
+        inputs=[name_input, area_radio, state],
+        outputs=[state, subject_page, register_page, welcome_md]
+    )
+
+    start_btn.click(
+        fn=start_quiz,
+        inputs=[subject_dropdown, total_q_slider, state],
+        outputs=[state, quiz_page, subject_page, question_text, choice_radio, topic_info, quiz_progress, q_info, score_info, gr.update(value=None), quiz_feedback]
+    )
+    
+    retry_weak_btn.click(
+        fn=start_weak_quiz,
+        inputs=[subject_dropdown, total_q_slider, state],
+        outputs=[state, quiz_page, subject_feedback]
+    )
+
+    submit_btn.click(
+        fn=handle_submit,
+        inputs=[choice_radio, state],
+        outputs=[state, quiz_feedback, submit_btn, next_btn, score_info]
+    )
+    
+    next_btn.click(
+        fn=next_question,
+        inputs=[state],
+        outputs=[state, quiz_page, finished_page, finished_page] # update visibility of pages
+    ).then(
+        fn=lambda: [gr.update(interactive=True), gr.update(interactive=False)], # enable submit, disable next
+        inputs=[],
+        outputs=[submit_btn, next_btn]
+    )
+
+    quit_btn.click(
+        fn=quit_quiz,
+        inputs=[state],
+        outputs=[state, quiz_page, finished_page, finished_page]
+    ).then(
+        fn=lambda: [gr.update(interactive=True), gr.update(interactive=False)],
+        inputs=[],
+        outputs=[submit_btn, next_btn]
+    )
+
+    demo.load(
+        fn=lambda s: [gr.update(visible=True) if s["stage"] == "finished" else gr.update(visible=False), # finished page
+                      gr.update(visible=True) if s["stage"] == "quiz" else gr.update(visible=False), # quiz page
+                      gr.update(visible=True) if s["stage"] == "subject" else gr.update(visible=False), # subject page
+                      gr.update(visible=True) if s["stage"] == "register" else gr.update(visible=False), # register page
+                     ],
+        inputs=[state],
+        outputs=[finished_page, quiz_page, subject_page, register_page]
+    )
+
+    choose_another_subject_btn.click(
+        fn=return_to_subject,
+        inputs=[state],
+        outputs=[state, finished_page, subject_page, quiz_page]
+    )
+    
+    retry_weak_after_finish_btn.click(
+        fn=start_weak_quiz,
+        inputs=[subject_dropdown, total_q_slider, state],
+        outputs=[state, quiz_page, subject_feedback]
+    )
+
+if __name__ == "__main__":
+    demo.launch()
