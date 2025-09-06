@@ -226,4 +226,53 @@ with gr.Blocks() as demo:
         )
         question_text = gr.Markdown()
         choice_radio = gr.Radio([], label="Choose an answer:", interactive=True)
-        subm
+        submit_btn = gr.Button("Submit Answer", interactive=True)
+        next_btn = gr.Button("Next Question", interactive=False, variant="primary")
+        quit_btn = gr.Button("Quit Quiz")
+        quiz_feedback = gr.Markdown("")
+        score_info = gr.Markdown("")
+
+    with gr.Group(visible=False) as review_page:
+        review_btn = gr.Button("Review Weak Clusters")
+        review_info = gr.Markdown("")
+
+    # Button wiring
+    start_btn.click(
+        start_quiz,
+        inputs=[user, subject],
+        outputs=[quiz_page, start_info]
+    ).then(
+        load_next_question,
+        outputs=[question_text, choice_radio, submit_btn, next_btn,
+                 quiz_feedback, quiz_progress, quiz_page, review_page]
+    )
+
+    submit_btn.click(
+        submit_answer,
+        inputs=[choice_radio],
+        outputs=[quiz_feedback, submit_btn, next_btn]
+    )
+
+    next_btn.click(
+        next_question,
+        outputs=[question_text, choice_radio, submit_btn, next_btn,
+                 quiz_feedback, quiz_progress, quiz_page, review_page]
+    )
+
+    quit_btn.click(
+        quit_quiz,
+        outputs=[question_text, choice_radio, submit_btn, next_btn,
+                 quiz_feedback, quiz_progress, quiz_page, review_page]
+    )
+
+    review_btn.click(
+        review_weak_clusters,
+        outputs=[review_info]
+    )
+
+# ====================================================
+# Launch App
+# ====================================================
+if __name__ == "__main__":
+    demo.launch()
+
